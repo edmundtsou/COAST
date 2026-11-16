@@ -117,15 +117,36 @@ def _spline(x: np.ndarray, df: int):
 
 
 def _nb_fit(y, design, offset):
-    """ML negative-binomial GLM (NB2). Returns (coefficients, dispersion alpha, converged)."""
+    """ML negative-binomial GLM (NB2). Returns (coefficients, dispersion alpha, converged).
+
+    BFGS on statsmodels' NegativeBinomial, started from statsmodels' own Poisson fit and moment estimate of alpha
+    passed as ``start_params``: with ``start_params=None`` statsmodels (0.15.0 and main, 2026-11) appends that alpha
+    unlogged although BFGS optimises log(alpha), so a gene with a large estimate starts at exp(alpha) and can
+    collapse to alpha ~ 0. If BFGS still fails, alpha maximises the profile likelihood over log(alpha) in
+    [1e-8, 1e3] (a bounded 1-D search, as DESeq2 and PyDESeq2 fall back to a grid search), with the GLM fitted at
+    each alpha and the NB log-likelihood evaluated by scipy (statsmodels' GLM ``llf`` is wrong as alpha -> 0); a gene
+    at the lower bound is a Poisson-like fit, not a failure.
+    """
     import statsmodels.api as sm
+    from scipy.optimize import minimize_scalar
+    from scipy.stats import nbinom
+    from statsmodels.discrete.discrete_model import NegativeBinomial, Poisson
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        fit = sm.NegativeBinomial(y, design, offset=offset).fit(disp=0, maxiter=200)
-    alpha = fit.params[-1]
-    converged = bool(fit.mle_retvals["converged"]) and np.isfinite(alpha)
-    return fit.params[:-1], max(alpha, 1e-8) if converged else 1e-8, converged   # floor: a Poisson-like gene
+        poisson = Poisson(y, design, offset=offset).fit(disp=0, warn_convergence=False)
+        model = NegativeBinomial(y, design, offset=offset)
+        alpha0 = max(0.05, model._estimate_dispersion(poisson.predict(), poisson.resid, df_resid=poisson.df_resid))
+        fit = model.fit(start_params=np.r_[poisson.params, alpha0], disp=0, maxiter=200)
+        alpha = fit.params[-1]
+        if fit.mle_retvals["converged"] and np.isfinite(alpha):
+            return fit.params[:-1], max(alpha, 1e-8), True
+        glm = lambda a: sm.GLM(y, design, family=sm.families.NegativeBinomial(alpha=a), offset=offset).fit()  # noqa: E731
+        loglik = lambda a: nbinom.logpmf(y, 1 / a, 1 / (1 + a * glm(a).fittedvalues)).sum()  # noqa: E731
+        best = minimize_scalar(lambda la: -loglik(np.exp(la)), bounds=(np.log(1e-8), np.log(1e3)), method="bounded")
+        alpha = float(np.exp(best.x))
+        fit = glm(alpha)
+    return np.asarray(fit.params, float), alpha, bool(fit.converged)
 
 
 def _nb_lr(y, null, full, offset):
