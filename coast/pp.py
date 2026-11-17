@@ -1,4 +1,4 @@
-"""Preprocessing: filter units, normalise, and integrate samples into one embedding."""
+"""Preprocessing: bins to units, filter units, normalise, and integrate samples into one embedding."""
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
@@ -10,6 +10,114 @@ from anndata import AnnData
 
 # Mitochondrial and ribosomal genes (mouse and human symbols). They are kept out of the integration features.
 DEFAULT_EXCLUDE = r"^(?:mt-|MT-|Rp[ls]\d|RP[LS]\d|Mrp[ls]\d|MRP[LS]\d)"
+
+
+def _second_moments(geometries: np.ndarray):
+    """Eigenvalues (largest, smallest) of each polygon's area covariance in px², and its area: exact Green's-theorem
+    moments over every ring (holes subtracted by orientation) and part, about the polygon's own centroid (the
+    ellipse of skimage's regionprops; major axis = 4 sqrt(largest))."""
+    import shapely
+
+    oriented = shapely.orient_polygons(geometries, exterior_cw=False)
+    parts, part_owner = shapely.get_parts(oriented, return_index=True)
+    rings, ring_part = shapely.get_rings(parts, return_index=True)
+    coords, vertex_ring = shapely.get_coordinates(rings, return_index=True)
+    owner = part_owner[ring_part[vertex_ring]]
+    xy = coords - shapely.get_coordinates(shapely.centroid(geometries))[owner]   # centred: no cancellation at 1e4 px
+    edge = vertex_ring[:-1] == vertex_ring[1:]
+    x0, y0 = xy[:-1][edge].T
+    x1, y1 = xy[1:][edge].T
+    who, cross, n = owner[:-1][edge], x0 * y1 - x1 * y0, len(geometries)
+    area = np.bincount(who, cross, minlength=n) / 2
+    sxx = np.bincount(who, (x0 * x0 + x0 * x1 + x1 * x1) * cross, minlength=n) / 12
+    syy = np.bincount(who, (y0 * y0 + y0 * y1 + y1 * y1) * cross, minlength=n) / 12
+    sxy = np.bincount(who, (x0 * y1 + 2 * x0 * y0 + 2 * x1 * y1 + x1 * y0) * cross, minlength=n) / 24
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cxx, cyy, cxy = sxx / area, syy / area, sxy / area
+    half, root = (cxx + cyy) / 2, np.sqrt(((cxx - cyy) / 2) ** 2 + cxy ** 2)
+    return half + root, np.clip(half - root, 0, None), area
+
+
+def morphometrics(geometries, microns_per_pixel: float) -> pd.DataFrame:
+    """Size, shape and centroid of each polygon. Ratios are NaN when their denominator is zero."""
+    import shapely
+
+    g = np.asarray(geometries, dtype=object)
+    area, perimeter = shapely.area(g), shapely.length(g)
+    hull, bounds = shapely.area(shapely.convex_hull(g)), shapely.bounds(g)
+    major2, minor2, _ = _second_moments(g)
+    centroid = shapely.get_coordinates(shapely.centroid(g))
+
+    def ratio(a, b):
+        a, b = np.asarray(a, float), np.asarray(b, float)
+        out = np.full(a.shape, np.nan)
+        ok = np.isfinite(a) & np.isfinite(b) & (b > 0)
+        out[ok] = a[ok] / b[ok]
+        return out
+
+    um, diameter = float(microns_per_pixel), np.sqrt(4 * area / np.pi)
+    major, minor = 4 * np.sqrt(major2), 4 * np.sqrt(minor2)
+    return pd.DataFrame({
+        "area_pixels": area, "area_um2": area * um ** 2, "perimeter_pixels": perimeter, "perimeter_um": perimeter * um,
+        "equivalent_diameter_pixels": diameter, "equivalent_diameter_um": diameter * um,
+        "circularity": np.clip(ratio(4 * np.pi * area, perimeter ** 2), 0, 1),
+        "solidity": np.clip(ratio(area, hull), 0, 1),
+        "extent": np.clip(ratio(area, (bounds[:, 2] - bounds[:, 0]) * (bounds[:, 3] - bounds[:, 1])), 0, 1),
+        "major_axis_length_um": major * um, "minor_axis_length_um": minor * um, "aspect_ratio": ratio(major, minor),
+        "eccentricity": np.sqrt(np.clip(1 - ratio(minor2, major2), 0, 1)),
+        "n_parts": shapely.get_num_geometries(g), "centroid_x": centroid[:, 0], "centroid_y": centroid[:, 1]})
+
+
+def bins_to_units(bins: AnnData, segmentation: pd.DataFrame, sample: str) -> AnnData:
+    """Sum the bins inside each segmented polygon: one unit (row) per polygon, raw counts.
+
+    Every bin goes to the polygon that covers its centre (``bins.obs['x']``, ``obs['y']``, in the polygons'
+    coordinates); a bin covered by several polygons (shared edge, overlap) goes to the first one the spatial index
+    returns, and a bin no polygon covers to none. ``bins`` comes from `coast.io.read_visium_hd` and ``segmentation``
+    from `coast.io.read_segmentation`.
+
+    Returns units x genes, named ``<sample>_<unit_id>``, with ``obs``: sample, unit_id, feature_index, seg_class,
+    seg_score, n_spots (bins in the unit), polygon_area_px, bin_coverage (n_spots x bin area / polygon area; low for
+    units clipped by the edge of the capture area) and the polygon's `morphometrics`; ``obsm['spatial']`` = centroid.
+    Every polygon is kept, including those with no bin. Writes ``bins.obs['unit']`` (the unit's name, NaN when
+    unassigned) and ``bins.obs['total_counts']``, which `doublets` uses.
+    """
+    import shapely
+    from scipy import sparse
+    from shapely.strtree import STRtree
+
+    geometries = segmentation["geometry"].to_numpy(object)
+    xy = bins.obs[["x", "y"]].to_numpy(float)
+    hits = STRtree(list(geometries)).query(shapely.points(xy[:, 0], xy[:, 1]), predicate="covered_by")
+    owner = np.full(bins.n_obs, -1)
+    if hits.size:
+        order = np.argsort(hits[0], kind="stable")
+        point, geom = hits[0][order], hits[1][order]
+        first = np.r_[True, point[1:] != point[:-1]]
+        owner[point[first]] = geom[first]
+    assigned = np.flatnonzero(owner >= 0)
+    n = len(segmentation)
+    indicator = sparse.csr_matrix((np.ones(assigned.size, np.float32), (owner[assigned], np.arange(assigned.size))),
+                                  shape=(n, assigned.size))
+    counts = sparse.csr_matrix(indicator @ sparse.csr_matrix(bins.X)[assigned], dtype=np.float32)
+    n_spots = np.bincount(owner[assigned], minlength=n)
+    names = (sample + "_" + segmentation["unit_id"].astype(str)).to_numpy()
+    um = bins.uns["microns_per_pixel"]
+    shape = morphometrics(geometries, um)
+    obs = pd.DataFrame({"sample": sample, "unit_id": segmentation["unit_id"].to_numpy(),
+                        "feature_index": segmentation["feature_index"].to_numpy(),
+                        "seg_class": segmentation["seg_class"].to_numpy(),
+                        "seg_score": segmentation["seg_score"].to_numpy(), "n_spots": n_spots,
+                        "polygon_area_px": shape["area_pixels"].to_numpy(),
+                        "bin_coverage": n_spots * bins.uns["bin_area_px"] / shape["area_pixels"].to_numpy()},
+                       index=pd.Index(names))
+    obs = pd.concat([obs, shape.set_index(obs.index)], axis=1)
+    units = AnnData(counts, obs=obs, var=bins.var.copy())
+    units.obsm["spatial"] = shape[["centroid_x", "centroid_y"]].to_numpy()
+    units.uns["microns_per_pixel"] = um
+    bins.obs["unit"] = pd.Series(np.where(owner >= 0, names[np.maximum(owner, 0)], None), index=bins.obs_names)
+    bins.obs["total_counts"] = np.asarray(bins.X.sum(axis=1)).ravel()
+    return units
 
 
 def filter_units(adata: AnnData, min_counts: float = 500, min_coverage: float | None = None,
@@ -180,7 +288,8 @@ def doublets(adata: AnnData, bins: AnnData, polygons: Sequence, regions: Mapping
                                                                       & (unit_bins >= 8) & candidate[rows])))
         b = b[np.argsort(unit[b], kind="stable")]
         pos = np.unique(unit[b], return_inverse=True)[1]
-        xy = bins.obs[["x", "y"]].to_numpy(float)[b]
+        # positions at float32, the precision of the paper's bin table: the cuts depend on their last bits
+        xy = bins.obs[["x", "y"]].to_numpy(np.float32).astype(float)[b]
         Mb = bins.X[b][:, bins.var_names.get_indexer(markers)].tocsr().astype(np.float32)
         cb = (bins.obs["total_counts"].to_numpy(float) if "total_counts" in bins.obs
               else np.asarray(bins.X.sum(1)).ravel())[b]

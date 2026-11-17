@@ -174,7 +174,7 @@ def _lr_all(y, null, full, offset, n_jobs):
     return np.array(rows, dtype=float).T
 
 
-def decoy_threshold(real: np.ndarray, decoy: np.ndarray, fdr: float = 0.05) -> float:
+def _decoy_threshold(real: np.ndarray, decoy: np.ndarray, fdr: float = 0.05) -> float:
     """Smallest statistic c with #(decoy >= c) / #(real >= c) <= ``fdr``; inf when none qualifies."""
     real, decoy = np.sort(real[np.isfinite(real)]), np.sort(decoy[np.isfinite(decoy)])
     for c in real:
@@ -224,7 +224,7 @@ def test_genes(adata: AnnData, x: str = "pseudostructure", groupby: str | None =
     decoy_lr, _, decoy_converged, _ = _lr_all(y, null, np.column_stack([null, _spline(decoy_position, df)[:, 1:]]),
                                            offset, n_jobs)
     ok = converged.astype(bool)
-    threshold = decoy_threshold(lr[ok], decoy_lr[ok & decoy_converged.astype(bool)], fdr)
+    threshold = _decoy_threshold(lr[ok], decoy_lr[ok & decoy_converged.astype(bool)], fdr)
     result = pd.DataFrame({"lr": lr, "p_chi2": chi2.sf(lr, df), "decoy_lr": decoy_lr, "log2_range": log2_range,
                            "alpha": alpha,
                            "converged": ok, "significant": ok & (lr >= threshold)}, index=pd.Index(genes, name="gene"))
@@ -453,3 +453,72 @@ def compare_groups(adata: AnnData, group_key: str, case: str, reference: str, sa
                           "selected_whole_axis": whole, "selected_local_window": local, "local_x": grid[at],
                           "expression_per_10k": expr}, index=pd.Index(genes, name="gene"))
     return table, pd.DataFrame(D, index=table.index, columns=pd.Index(np.round(grid, 4), name=x))
+
+
+def _zshape(c: np.ndarray) -> np.ndarray:
+    c = c - c.mean(-1, keepdims=True)
+    return c / c.std(-1, keepdims=True)
+
+
+def shape_clusters(curves: pd.DataFrame, reference: Sequence[str], case: Sequence[str], min_change: float = 0.5,
+                   tau: float = 0.5, rho: float = 0.5, k: int = 4):
+    """Genes whose shape along the coordinate differs between two groups of samples, clustered by how it differs.
+
+    ``curves`` are the (sample, gene) x positions curves of `fit_curves` (log2 counts per 10k). Only positions where
+    every curve is defined are used. Each sample's curve, log2(counts per 10k + 0.5), is centred and scaled to unit
+    variance, so only its shape is compared, never its level or amplitude (so it also works across probe panels).
+
+    1. Eligible: the gene changes by at least ``min_change`` log2 along the axis in every sample of at least one
+       group (a z-scored flat curve is noise).
+    2. Difference curve: the mean shape of the ``case`` samples minus that of the ``reference`` samples. The same
+       difference for every mixed split (each side holds half of both groups, so the group difference cancels) is
+       the null. A gene changes shape when its difference curve has root mean square >= ``tau`` (z units; 2 is a
+       full reversal, sqrt(2) two unrelated shapes) and every mixed split's is <= ``rho`` times it.
+    3. The changed genes' difference curves, scaled to unit variance, are cut into ``k`` Ward clusters, numbered by
+       where the cluster's mean difference peaks along the axis.
+
+    Returns (table, shapes): one row per eligible gene (rms, null_rms, changed, cluster; 0 = unchanged), and the
+    z-scored shapes, (sample, gene) x positions.
+    """
+    import itertools
+
+    from scipy.cluster.hierarchy import fcluster, linkage
+
+    reference, case = list(reference), list(case)
+    if min(len(reference), len(case)) < 2:
+        raise ValueError("shape_clusters needs at least two samples per group (no mixed split otherwise)")
+    samples = reference + case
+    genes = curves.index.get_level_values(1).unique()
+    c = {s: curves.loc[s].reindex(genes).to_numpy(float) for s in samples}
+    fitted = np.all([np.isfinite(c[s]).any(1) for s in samples], 0)   # genes whose fit failed somewhere: dropped
+    genes = genes[fitted]
+    c = {s: v[fitted] for s, v in c.items()}
+    on = np.all([np.isfinite(v).all(0) for v in c.values()], 0)
+    logc = {s: np.log2(2.0 ** v[:, on] + 0.5) for s, v in c.items()}
+    graded = [np.all([np.ptp(logc[s], 1) >= min_change for s in g], 0) for g in (reference, case)]
+    eligible = graded[0] | graded[1]
+    genes = genes[eligible]
+    z = {s: _zshape(v[eligible]) for s, v in logc.items()}
+    mean = lambda names: np.mean([z[s] for s in names], 0)  # noqa: E731
+    diff = mean(case) - mean(reference)
+    rms = lambda v: np.sqrt((v ** 2).mean(-1))  # noqa: E731
+    splits = [(hc, hr) for hc in itertools.combinations(case, len(case) // 2) if case[0] in hc
+              for hr in itertools.combinations(reference, len(reference) // 2)]
+    side = lambda c_, r_: (mean(c_) + mean(r_)) / 2  # noqa: E731   half of each group on each side
+    null = [rms(side([s for s in case if s not in hc], [s for s in reference if s not in hr]) - side(hc, hr))
+            for hc, hr in splits]
+    r, null = rms(diff), np.max(null, 0)
+    changed = (r >= tau) & (null <= rho * r)
+    cluster = np.zeros(len(genes), int)
+    if changed.sum() >= k:
+        u = _zshape(diff[changed])
+        lab = fcluster(linkage(u, "ward"), k, "maxclust")
+        peak = {g: np.argmax(np.abs(u[lab == g].mean(0))) for g in np.unique(lab)}
+        order = {g: i + 1 for i, g in enumerate(sorted(peak, key=peak.get))}
+        cluster[changed] = [order[g] for g in lab]
+    table = pd.DataFrame({"rms": r, "null_rms": null, "changed": changed, "cluster": cluster},
+                         index=pd.Index(genes, name="gene"))
+    columns = curves.columns[on]
+    index = pd.MultiIndex.from_product([samples, genes], names=[curves.index.names[0], "gene"])
+    shapes = pd.DataFrame(np.concatenate([z[s] for s in samples]), index=index, columns=columns)
+    return table, shapes

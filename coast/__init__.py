@@ -1,4 +1,4 @@
 """COAST: Continuous Ordering of Anatomical Structures from Transcriptomics."""
-from . import pl, pp, tl
+from . import io, pl, pp, tl
 
 __version__ = "0.1.0"
