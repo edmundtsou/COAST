@@ -147,7 +147,11 @@ def _chunks(n: int, n_jobs) -> list:
 
 def _nb_irls(y, X, P, offset, alpha, beta, tol=1e-10, max_iter=100):
     """NB2 GLM coefficients at a fixed dispersion ``alpha`` by IRLS from ``beta``, halving any step that lowers
-    the likelihood. Returns (beta, mu, converged)."""
+    the likelihood. Returns (beta, mu, converged).
+
+    Converged: the coefficients stop moving (< ``tol``) or, failing that, the last step changed the deviance by
+    < 1e-8 relative (R's ``glm`` rule). The second case is a gene with no counts on part of the axis: a coefficient
+    drifts towards -inf while the fit no longer changes."""
     p = X.shape[1]
     r = 1 / alpha
 
@@ -156,7 +160,9 @@ def _nb_irls(y, X, P, offset, alpha, beta, tol=1e-10, max_iter=100):
 
     mu = np.exp(np.clip(X @ beta + offset, -50, 50))
     current = loglik(mu)
+    previous_mu = mu
     for _ in range(max_iter):
+        previous_mu = mu
         eta = np.log(mu)
         w = mu / (1 + alpha * mu)
         step = np.linalg.solve(_gram(P, w, p) + 1e-10 * np.eye(p), X.T @ (w * (eta - offset + (y - mu) / mu))) - beta
@@ -171,7 +177,8 @@ def _nb_irls(y, X, P, offset, alpha, beta, tol=1e-10, max_iter=100):
         beta, mu, current = new_beta, new_mu, new
         if done:
             return beta, mu, True
-    return beta, mu, False
+    deviance = _nb_deviance(y, mu, alpha)
+    return beta, mu, bool(abs(deviance - _nb_deviance(y, previous_mu, alpha)) < 1e-8 * (abs(deviance) + 0.1))
 
 
 def _nb_deviance(y, mu, alpha):
