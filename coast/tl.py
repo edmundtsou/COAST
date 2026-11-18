@@ -1,7 +1,6 @@
 """Tools: cluster labels, the pseudostructure coordinate, and gene shapes along it."""
 from __future__ import annotations
 
-import warnings
 from collections.abc import Mapping, Sequence
 
 import numpy as np
@@ -116,62 +115,137 @@ def _spline(x: np.ndarray, df: int):
     return patsy.dmatrix(f"bs(x, df={df}, degree=3)", {"x": x})
 
 
-def _nb_fit(y, design, offset):
+_TRIU: dict = {}
+
+
+def _triu(p: int):
+    if p not in _TRIU:
+        _TRIU[p] = np.triu_indices(p)
+    return _TRIU[p]
+
+
+def _outer(X: np.ndarray) -> np.ndarray:
+    """Upper-triangle products of each row of ``X`` with itself (units x p(p+1)/2): X' diag(w) X = w @ _outer(X)."""
+    i, j = _triu(X.shape[1])
+    return X[:, i] * X[:, j]
+
+
+def _gram(P: np.ndarray, w: np.ndarray, p: int) -> np.ndarray:
+    """X' diag(w) X from ``P = _outer(X)``: one vector-matrix product instead of a units x p x p product."""
+    i, j = _triu(p)
+    H = np.empty((p, p))
+    H[i, j] = H[j, i] = w @ P
+    return H
+
+
+def _chunks(n: int, n_jobs) -> list:
+    """Gene indices in contiguous chunks, a few per worker, so shared arrays are sent once per chunk, not per gene."""
+    from joblib import effective_n_jobs
+
+    return [c for c in np.array_split(np.arange(n), max(1, 4 * effective_n_jobs(n_jobs))) if len(c)]
+
+
+def _nb_irls(y, X, P, offset, alpha, beta, tol=1e-10, max_iter=100):
+    """NB2 GLM coefficients at a fixed dispersion ``alpha`` by IRLS from ``beta``, halving any step that lowers
+    the likelihood. Returns (beta, mu, converged)."""
+    p = X.shape[1]
+    r = 1 / alpha
+
+    def loglik(mu):   # the parts of the NB log-likelihood that depend on mu
+        return (y * np.log(mu) - (y + r) * np.log(r + mu)).sum()
+
+    mu = np.exp(np.clip(X @ beta + offset, -50, 50))
+    current = loglik(mu)
+    for _ in range(max_iter):
+        eta = np.log(mu)
+        w = mu / (1 + alpha * mu)
+        step = np.linalg.solve(_gram(P, w, p) + 1e-10 * np.eye(p), X.T @ (w * (eta - offset + (y - mu) / mu))) - beta
+        for _ in range(30):
+            new_beta = beta + step
+            new_mu = np.exp(np.clip(X @ new_beta + offset, -50, 50))
+            new = loglik(new_mu)
+            if np.isfinite(new) and new >= current - 1e-12 * abs(current):
+                break
+            step = step / 2
+        done = np.max(np.abs(new_beta - beta)) < tol
+        beta, mu, current = new_beta, new_mu, new
+        if done:
+            return beta, mu, True
+    return beta, mu, False
+
+
+def _nb_deviance(y, mu, alpha):
+    r = 1 / alpha
+    with np.errstate(divide="ignore", invalid="ignore"):
+        term = np.where(y > 0, y * np.log(y / mu), 0.0)
+    return 2 * (term - (y + r) * np.log((y + r) / (mu + r))).sum()
+
+
+def _nb_fit(y, design, offset, P=None):
     """ML negative-binomial GLM (NB2). Returns (coefficients, dispersion alpha, converged).
 
-    BFGS on statsmodels' NegativeBinomial, started from statsmodels' own Poisson fit and moment estimate of alpha
-    passed as ``start_params``: with ``start_params=None`` statsmodels (0.15.0 and main, 2026-11) appends that alpha
-    unlogged although BFGS optimises log(alpha), so a gene with a large estimate starts at exp(alpha) and can
-    collapse to alpha ~ 0. If BFGS still fails, alpha maximises the profile likelihood over log(alpha) in
-    [1e-8, 1e3] (a bounded 1-D search, as DESeq2 and PyDESeq2 fall back to a grid search), with the GLM fitted at
-    each alpha and the NB log-likelihood evaluated by scipy (statsmodels' GLM ``llf`` is wrong as alpha -> 0); a gene
-    at the lower bound is a Poisson-like fit, not a failure.
+    alpha maximises the profile likelihood over log(alpha) in [1e-8, 1e3] (a bounded 1-D search), with the GLM
+    coefficients fitted by IRLS at each alpha (warm-started from the previous alpha). The NB log-likelihood is
+    evaluated exactly; a gene at the lower bound is a Poisson-like fit, not a failure. ``P`` = `_outer` of
+    ``design`` (computed when not given).
     """
-    import statsmodels.api as sm
     from scipy.optimize import minimize_scalar
-    from scipy.stats import nbinom
-    from statsmodels.discrete.discrete_model import NegativeBinomial, Poisson
+    from scipy.special import gammaln
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        poisson = Poisson(y, design, offset=offset).fit(disp=0, warn_convergence=False)
-        model = NegativeBinomial(y, design, offset=offset)
-        alpha0 = max(0.05, model._estimate_dispersion(poisson.predict(), poisson.resid, df_resid=poisson.df_resid))
-        fit = model.fit(start_params=np.r_[poisson.params, alpha0], disp=0, maxiter=200)
-        alpha = fit.params[-1]
-        if fit.mle_retvals["converged"] and np.isfinite(alpha):
-            return fit.params[:-1], max(alpha, 1e-8), True
-        glm = lambda a: sm.GLM(y, design, family=sm.families.NegativeBinomial(alpha=a), offset=offset).fit()  # noqa: E731
-        loglik = lambda a: nbinom.logpmf(y, 1 / a, 1 / (1 + a * glm(a).fittedvalues)).sum()  # noqa: E731
-        best = minimize_scalar(lambda la: -loglik(np.exp(la)), bounds=(np.log(1e-8), np.log(1e3)), method="bounded")
+    P = _outer(design) if P is None else P
+    values, counts = np.unique(y, return_counts=True)   # sum of lgamma(y + r) over the few distinct counts
+    n, log_y_factorial = len(y), gammaln(y + 1).sum()
+    flat = np.full(n, np.log((y.sum() + 0.5) / np.exp(offset).sum()))   # start: one rate for every unit
+    state = {"beta": np.linalg.lstsq(design, flat, rcond=None)[0]}
+
+    def negative_profile(log_alpha):
+        alpha = np.exp(log_alpha)
+        r = 1 / alpha
+        b, mu, _ = _nb_irls(y, design, P, offset, alpha, state["beta"])
+        state["beta"] = b
+        ll = ((counts * gammaln(values + r)).sum() - n * gammaln(r) - log_y_factorial
+              + (r * np.log(r / (r + mu))).sum() + (y * np.log(mu / (r + mu))).sum())
+        return -ll if np.isfinite(ll) else np.inf
+
+    with np.errstate(all="ignore"):
+        best = minimize_scalar(negative_profile, bounds=(np.log(1e-8), np.log(1e3)), method="bounded",
+                               options=dict(xatol=1e-6))
         alpha = float(np.exp(best.x))
-        fit = glm(alpha)
-    return np.asarray(fit.params, float), alpha, bool(fit.converged)
+        coefficients, _, converged = _nb_irls(y, design, P, offset, alpha, state["beta"])
+    return coefficients, alpha, bool(converged and best.success and np.isfinite(coefficients).all())
 
 
-def _nb_lr(y, null, full, offset):
+def _nb_lr(y, null, full, offset, P_null=None, P_full=None):
     """Likelihood ratio of ``full`` against ``null`` (the dispersion estimated under ``full``), the dispersion,
     convergence, and the log2 range (5th to 95th percentile over units) of the terms ``full`` adds to ``null``."""
-    import statsmodels.api as sm
-
+    P_null = _outer(null) if P_null is None else P_null
+    P_full = _outer(full) if P_full is None else P_full
+    q = null.shape[1]
     try:
-        _, alpha, converged = _nb_fit(y, full, offset)
-        family = sm.families.NegativeBinomial(alpha=alpha)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            fit = sm.GLM(y, full, family=family, offset=offset).fit()
-            lr = sm.GLM(y, null, family=family, offset=offset).fit().deviance - fit.deviance
+        coefficients, alpha, converged = _nb_fit(y, full, offset, P_full)
+        with np.errstate(all="ignore"):
+            mu_full = np.exp(np.clip(full @ coefficients + offset, -50, 50))
+            start = np.linalg.lstsq(null, full[:, :q] @ coefficients[:q], rcond=None)[0]
+            _, mu_null, _ = _nb_irls(y, null, P_null, offset, alpha, start)
+            lr = _nb_deviance(y, mu_null, alpha) - _nb_deviance(y, mu_full, alpha)
     except (ValueError, np.linalg.LinAlgError):   # a gene with almost no counts: report it as not converged
         return np.nan, np.nan, False, np.nan
-    added = full[:, null.shape[1]:] @ fit.params[null.shape[1]:]
+    if not np.isfinite(lr):
+        return np.nan, alpha, False, np.nan
+    added = full[:, q:] @ coefficients[q:]
     return lr, alpha, converged, np.subtract(*np.percentile(added, [95, 5])) / np.log(2)
+
+
+def _lr_chunk(y, null, full, offset):
+    P_null, P_full = _outer(null), _outer(full)
+    return [_nb_lr(y[:, j], null, full, offset, P_null, P_full) for j in range(y.shape[1])]
 
 
 def _lr_all(y, null, full, offset, n_jobs):
     from joblib import Parallel, delayed
 
-    rows = Parallel(n_jobs=n_jobs)(delayed(_nb_lr)(y[:, j], null, full, offset) for j in range(y.shape[1]))
-    return np.array(rows, dtype=float).T
+    parts = Parallel(n_jobs=n_jobs)(delayed(_lr_chunk)(y[:, c], null, full, offset) for c in _chunks(y.shape[1], n_jobs))
+    return np.array([row for part in parts for row in part], dtype=float).T
 
 
 def _decoy_threshold(real: np.ndarray, decoy: np.ndarray, fdr: float = 0.05) -> float:
@@ -255,31 +329,55 @@ def _nb_gam(y: np.ndarray, blocks: list, S: np.ndarray):
     """Negative-binomial GAM with one penalised cubic regression spline per sample, all sharing one smoothing
     parameter and one dispersion (tradeSeq's model). ``blocks`` holds (rows, basis, offset) per sample. The smoothing
     parameter and theta maximise the Laplace-approximate restricted likelihood (REML); coefficients by penalised IRLS.
-    Returns samples x knots coefficients (log rate at the knots), or None when the fit fails."""
+    Returns samples x knots coefficients (log rate at the knots), or None when the fit fails.
+
+    Numerics: the IRLS works in the eigenbasis of ``S`` (an orthogonal change of coefficients, so the model and the
+    criterion are unchanged) and solves each step with diagonal scaling. In the knot basis a very large smoothing
+    parameter (a gene whose best curve is a straight line on the log scale) made every step ill-conditioned: the
+    IRLS never met its tolerance and the criterion jittered by several units, so the optimiser spent its whole
+    iteration budget there. ``blocks`` may carry a fourth element, the `_gam_basis` of its basis (computed here
+    otherwise)."""
     from scipy.optimize import minimize
     from scipy.special import gammaln
 
-    rank = S.shape[0] - 2
-    beta = [np.full(S.shape[0], np.log((y[r].sum() + 0.5) / np.exp(o).sum())) for r, _, o in blocks]
-    lam0 = np.mean([np.trace(X.T @ X) for _, X, _ in blocks]) / np.trace(S)
+    k = S.shape[0]
+    rank = k - 2
+    s, U = _penalty_eigen(S)
+    beta = [U.T @ np.full(k, np.log((y[blk[0]].sum() + 0.5) / np.exp(blk[2]).sum())) for blk in blocks]
+    lam0 = np.mean([np.trace(blk[1].T @ blk[1]) for blk in blocks]) / np.trace(S)
+    prepared = []   # per sample: counts, rotated basis, offset, its row outer products, distinct counts, sum lgamma(y+1)
+    for blk in blocks:
+        yb, o = y[blk[0]], blk[2]
+        Xr, P = blk[3] if len(blk) > 3 else _gam_basis(blk[1], U)
+        values, counts = np.unique(yb, return_counts=True)
+        prepared.append((yb, Xr, o, P, values, counts, gammaln(yb + 1).sum()))
 
     def criterion(par):
         lam, theta = lam0 * np.exp(par[0]), np.exp(par[1])
         value = -0.5 * len(blocks) * rank * np.log(lam)
-        for b, (r, X, o) in enumerate(blocks):
-            yb, bb, step = y[r], beta[b], np.inf
-            for it in range(101):   # penalised IRLS (a tiny ridge keeps a sample without counts solvable)
+        penalty = lam * s + 1e-8   # the tiny ridge keeps a sample without counts solvable
+        for b, (yb, X, o, P, values, counts, log_y_factorial) in enumerate(prepared):
+            bb, step = beta[b], np.inf
+            for it in range(101):   # penalised IRLS
                 eta = np.clip(X @ bb + o, -50, 50)
                 mu = np.exp(eta)
                 w = mu / (1 + mu / theta)
-                H = X.T @ (w[:, None] * X) + lam * S + 1e-8 * np.eye(len(S))
+                H = _gram(P, w, k)
+                H[np.diag_indices(k)] += penalty
+                d = 1 / np.sqrt(np.diag(H))
                 if it == 100 or np.max(np.abs(step)) < 1e-8:
                     break
-                step = np.linalg.solve(H, X.T @ (w * (eta - o + (yb - mu) / mu))) - bb
+                g = X.T @ (w * (eta - o + (yb - mu) / mu))
+                step = d * np.linalg.solve(d[:, None] * H * d, d * g) - bb
+                step_knots = U @ step
                 bb = bb + step
-            ll = (gammaln(yb + theta) - gammaln(theta) - gammaln(yb + 1) + theta * np.log(theta / (theta + mu))
-                  + yb * (eta - np.log(theta + mu))).sum()
-            value += -ll + 0.5 * lam * bb @ S @ bb + 0.5 * np.linalg.slogdet(H)[1]
+                step = step_knots   # the tolerance applies to the knot coefficients, as before
+            n = len(yb)
+            log_theta_mu = np.log(theta + mu)
+            ll = ((counts * gammaln(values + theta)).sum() - n * gammaln(theta) - log_y_factorial
+                  + n * theta * np.log(theta) - theta * log_theta_mu.sum() + yb @ (eta - log_theta_mu))
+            logdet = np.linalg.slogdet(d[:, None] * H * d)[1] - 2 * np.log(d).sum()
+            value += -ll + 0.5 * lam * (s * bb ** 2).sum() + 0.5 * logdet
             beta[b] = bb
         return value if np.isfinite(value) else 1e300
 
@@ -290,8 +388,25 @@ def _nb_gam(y: np.ndarray, blocks: list, S: np.ndarray):
             criterion(res.x)   # coefficients at the optimum
     except np.linalg.LinAlgError:
         return None
-    out = np.array(beta)
+    out = np.array(beta) @ U.T   # back to the knot basis (log rate at the knots)
     return out if np.isfinite(out).all() else None
+
+
+def _penalty_eigen(S: np.ndarray):
+    """Eigenvalues (exact zeros for the unpenalised straight line) and eigenvectors of the penalty matrix."""
+    s, U = np.linalg.eigh(S)
+    s[s < 1e-10 * s.max()] = 0.0
+    return s, U
+
+
+def _gam_basis(X: np.ndarray, U: np.ndarray):
+    """The basis in the penalty's eigenbasis and its row outer products (`_outer`)."""
+    Xr = X @ U
+    return Xr, _outer(Xr)
+
+
+def _nb_gam_chunk(y: np.ndarray, blocks: list, S: np.ndarray) -> list:
+    return [_nb_gam(y[:, j], blocks, S) for j in range(y.shape[1])]
 
 
 def fit_curves(adata: AnnData, genes, x: str = "pseudostructure", sample_key: str | None = None, layer: str = "counts",
@@ -319,10 +434,12 @@ def fit_curves(adata: AnnData, genes, x: str = "pseudostructure", sample_key: st
     rows = [np.arange(adata.n_obs) if s is None else np.flatnonzero(adata.obs[sample_key].to_numpy() == s)
             for s in samples]
     basis, S = _cr_basis(position, knots)
-    blocks = [(r, basis[r], offset[r]) for r in rows]
+    U = _penalty_eigen(S)[1]
+    blocks = [(r, basis[r], offset[r], _gam_basis(basis[r], U)) for r in rows]
     on_grid = _cr_basis(grid, knots)[0]
     outside = np.array([(grid < position[r].min()) | (grid > position[r].max()) for r in rows])
-    fits = Parallel(n_jobs=n_jobs)(delayed(_nb_gam)(y[:, j], blocks, S) for j in range(y.shape[1]))
+    parts = Parallel(n_jobs=n_jobs)(delayed(_nb_gam_chunk)(y[:, c], blocks, S) for c in _chunks(y.shape[1], n_jobs))
+    fits = [beta for part in parts for beta in part]
     curves = np.full((len(samples), len(genes), n_points), np.nan)
     for j, beta in enumerate(fits):
         if beta is not None:
